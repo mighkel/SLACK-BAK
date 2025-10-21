@@ -1,4 +1,4 @@
-(Pasted from an LLM chat.  Need to tune this.)
+(Pasted from an LLM chat.  Need to add to and tune this.)
 
 If your Slack Workspace allows you to create “Slack Apps”:
 
@@ -13,7 +13,7 @@ Give it a name (e.g., channel-exporter) and choose your workspace
 Under OAuth & Permissions, scroll to Scopes
 
 Add these user scopes:
-
+```
 channels:history
 groups:history
 im:history
@@ -23,18 +23,19 @@ channels:read
 groups:read
 im:read
 mpim:read
+```
 
 
 Click Install App to Workspace → Allow
 
 Copy your User OAuth Token — it will look like:
 
-xoxp-1234567890-0987654321-ABCDEF...
+`xoxp-1234567890-0987654321-ABCDEF...`
 
 Step 2 – Use That Token in a Local Export Script
 
 Example using Python + Slack SDK:
-
+```
 from slack_sdk import WebClient
 import json
 
@@ -60,7 +61,7 @@ while True:
 with open(f"{channel_name}.json", "w") as f:
     json.dump(messages, f, indent=2)
 print(f"Saved {len(messages)} messages from #{channel_name}")
-
+```
 
 Then you can run a cleanup/anonymization pass like the one I showed earlier.
 
