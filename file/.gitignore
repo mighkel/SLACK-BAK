@@ -15,13 +15,7 @@ config.json
 !requirements.txt
 !package.json
 !README.md
-!LICENSE.md
-!test.md
-!test.txt
-!quick_start_guide.md
-!slack_app_description.md
-!slack_export_readme.md
-!implementation_summary.md
+!LICENSE
 
 # Export directories
 output/
