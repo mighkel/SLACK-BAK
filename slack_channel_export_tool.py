@@ -40,25 +40,76 @@ try:
     HAS_REQUESTS = True
 except ImportError:
     HAS_REQUESTS = False
-    print("⚠️  'requests' library not found. File downloads will be limited.")
-    print("   Install with: pip install requests")
-    print()
 
-# === USER SETTINGS ===
-SLACK_TOKEN = "xoxp-123456789..."        # Paste your Slack user token here
-OUTPUT_DIR = r"C:\SlackExports\Output"   # Folder to save output files (edit as needed)
-FETCH_THREADS = True                      # Set to False to skip threaded replies (faster)
-INCLUDE_REACTIONS = True                  # Include emoji reactions in output
-DOWNLOAD_FILES = False                    # Set to True to download file attachments (slower, uses disk space)
-CREATE_MARKDOWN = False                   # Set to True to create .md formatted output
-ENABLE_LOGGING = True                     # Set to True to create detailed log files
-MAX_RETRIES = 3                          # Number of retries for API calls
-# ======================
+# === CONFIGURATION LOADER ===
+def load_config():
+    """Load configuration from config.json if it exists, otherwise use defaults."""
+    default_config = {
+        "slack_token": "xoxp-123456789...",
+        "output_dir": r"C:\SlackExports\Output",
+        "features": {
+            "fetch_threads": True,
+            "include_reactions": True,
+            "download_files": False,
+            "create_markdown": False,
+            "enable_logging": True
+        },
+        "performance": {
+            "max_retries": 3
+        }
+    }
+    
+    config_path = "config.json"
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                loaded_config = json.load(f)
+                print("✅ Loaded configuration from config.json")
+                return loaded_config
+        except Exception as e:
+            print(f"⚠️  Error loading config.json: {e}")
+            print("   Using default settings from script")
+            return default_config
+    else:
+        print("ℹ️  No config.json found - using default settings")
+        print("   To use config file: copy config.example.json to config.json and edit")
+        return default_config
+
+# Load configuration
+config = load_config()
+
+# Extract settings from config
+SLACK_TOKEN = config.get("slack_token", "xoxp-123456789...")
+OUTPUT_DIR = config.get("output_dir", r"C:\SlackExports\Output")
+FETCH_THREADS = config.get("features", {}).get("fetch_threads", True)
+INCLUDE_REACTIONS = config.get("features", {}).get("include_reactions", True)
+DOWNLOAD_FILES = config.get("features", {}).get("download_files", False)
+CREATE_MARKDOWN = config.get("features", {}).get("create_markdown", False)
+ENABLE_LOGGING = config.get("features", {}).get("enable_logging", True)
+MAX_RETRIES = config.get("performance", {}).get("max_retries", 3)
+
+# Create timestamped export folder
+EXPORT_TIMESTAMP = datetime.now().strftime("%Y-%m-%d-%H%M")
+EXPORT_FOLDER = os.path.join(OUTPUT_DIR, EXPORT_TIMESTAMP)
+os.makedirs(EXPORT_FOLDER, exist_ok=True)
+
+# Validate token
+if SLACK_TOKEN == "xoxp-123456789..." or not SLACK_TOKEN.startswith("xoxp-"):
+    print("\n" + "="*60)
+    print("❌ ERROR: Invalid or missing Slack token!")
+    print("="*60)
+    print("\nPlease set up your configuration:")
+    print("1. Copy config.example.json to config.json")
+    print("2. Edit config.json and add your real token")
+    print("3. Get your token from: https://api.slack.com/apps")
+    print("\nOr edit the SLACK_TOKEN variable at the top of this script.")
+    print("="*60 + "\n")
+    input("Press Enter to exit...")
+    sys.exit(1)
 
 # Configure logging if enabled
 if ENABLE_LOGGING:
-    log_filename = os.path.join(OUTPUT_DIR, f"slack_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    log_filename = os.path.join(EXPORT_FOLDER, f"{EXPORT_TIMESTAMP}-export.log")
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
@@ -72,14 +123,18 @@ else:
     logging.basicConfig(level=logging.WARNING)
     logger = logging.getLogger(__name__)
 
+if not HAS_REQUESTS and DOWNLOAD_FILES:
+    print("⚠️  'requests' library not found. File downloads will be disabled.")
+    print("   Install with: pip install requests\n")
+    DOWNLOAD_FILES = False
+
 class SlackExporter:
-    def __init__(self, token: str, output_dir: str):
+    def __init__(self, token: str, export_folder: str):
         self.client = WebClient(token=token)
-        self.output_dir = output_dir
+        self.export_folder = export_folder
         self.id_to_name = {}
         self.anon_map = {}
         self.anon_counter = 1
-        os.makedirs(output_dir, exist_ok=True)
         
     def retry_api_call(self, func, *args, **kwargs):
         """Retry API calls with exponential backoff."""
@@ -172,14 +227,14 @@ class SlackExporter:
             return None
         
         try:
-            # Get download URL
+            # Get download URL (prefer url_private_download)
             url = file_info.get("url_private_download") or file_info.get("url_private")
             if not url:
                 logger.warning(f"No download URL found for file: {file_info.get('name', 'unknown')}")
                 return None
             
             # Create attachments directory
-            attach_dir = os.path.join(self.output_dir, "attachments", channel_name)
+            attach_dir = os.path.join(self.export_folder, "attachments", channel_name)
             os.makedirs(attach_dir, exist_ok=True)
             
             # Generate safe filename
@@ -188,24 +243,57 @@ class SlackExporter:
             safe_filename = f"{timestamp}_{original_name}"
             local_path = os.path.join(attach_dir, safe_filename)
             
-            # Download with authentication
+            # Get expected file size from metadata
+            expected_size = file_info.get("size", 0)
+            
+            # Download with authentication - DON'T use streaming for better reliability
             headers = {"Authorization": f"Bearer {self.client.token}"}
-            response = requests.get(url, headers=headers, stream=True, timeout=30)
+            logger.debug(f"Downloading {original_name} from {url[:50]}...")
+            
+            # Download entire file at once (more reliable than streaming for these file sizes)
+            response = requests.get(url, headers=headers, timeout=60)
             response.raise_for_status()
+            
+            # Check content type - make sure we got the actual file, not an error page
+            content_type = response.headers.get('content-type', '')
+            if 'text/html' in content_type:
+                logger.error(f"Got HTML instead of file for {original_name} - may be auth issue")
+                return None
             
             # Save file
             with open(local_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
+                f.write(response.content)
             
-            logger.info(f"Downloaded: {original_name}")
-            return os.path.relpath(local_path, self.output_dir)
+            # Verify file was written correctly
+            actual_size = os.path.getsize(local_path)
             
+            if actual_size == 0:
+                logger.error(f"Downloaded file is empty: {original_name}")
+                os.remove(local_path)
+                return None
+            
+            # Verify size matches expected
+            if expected_size > 0 and actual_size != expected_size:
+                size_diff = abs(actual_size - expected_size)
+                percent_diff = (size_diff / expected_size) * 100
+                
+                if percent_diff > 5:  # More than 5% difference is concerning
+                    logger.warning(f"Size mismatch for {original_name}: expected {expected_size}, got {actual_size} ({percent_diff:.1f}% diff)")
+                else:
+                    logger.info(f"Downloaded: {original_name} ({actual_size:,} bytes)")
+            else:
+                logger.info(f"Downloaded: {original_name} ({actual_size:,} bytes)")
+            
+            return os.path.relpath(local_path, self.export_folder)
+            
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error downloading {file_info.get('name', 'unknown')}: {e.response.status_code}")
+            return None
         except requests.exceptions.RequestException as e:
-            logger.warning(f"Failed to download {file_info.get('name', 'unknown')}: {str(e)}")
+            logger.warning(f"Network error downloading {file_info.get('name', 'unknown')}: {str(e)}")
             return None
         except Exception as e:
-            logger.warning(f"Unexpected error downloading file: {str(e)}")
+            logger.error(f"Unexpected error downloading {file_info.get('name', 'unknown')}: {str(e)}", exc_info=True)
             return None
 
     def fetch_thread_replies(self, channel_id: str, thread_ts: str) -> List[Dict]:
@@ -267,15 +355,6 @@ class SlackExporter:
             if INCLUDE_REACTIONS and msg.get("reactions"):
                 reactions = " ".join([f":{r['name']}:" for r in msg["reactions"]])
                 output += f"{prefix}*Reactions: {reactions}*\n"
-            
-            # Add code blocks if present
-            if msg.get("blocks"):
-                for block in msg["blocks"]:
-                    if block.get("type") == "rich_text":
-                        for element in block.get("elements", []):
-                            if element.get("type") == "rich_text_preformatted":
-                                code = "\n".join([e.get("text", "") for e in element.get("elements", [])])
-                                output += f"{prefix}```\n{code}\n```\n"
             
             # Add file info
             if msg.get("files"):
@@ -348,13 +427,13 @@ class SlackExporter:
         md_name = f"{timestamp_str}-Slack-Export-{cname}.md" if CREATE_MARKDOWN else None
         
         # Save JSON
-        json_path = os.path.join(self.output_dir, json_name)
+        json_path = os.path.join(self.export_folder, json_name)
         with open(json_path, "w", encoding="utf-8") as jf:
             json.dump(messages, jf, indent=2, ensure_ascii=False)
         logger.info(f"Saved JSON: {json_name}")
         
         # Save text
-        txt_path = os.path.join(self.output_dir, txt_name)
+        txt_path = os.path.join(self.export_folder, txt_name)
         with open(txt_path, "w", encoding="utf-8") as tf:
             for msg in reversed(messages):
                 tf.write(self.format_message_text(msg, format_type="text") + "\n")
@@ -370,7 +449,7 @@ class SlackExporter:
         
         # Save markdown if enabled
         if CREATE_MARKDOWN:
-            md_path = os.path.join(self.output_dir, md_name)
+            md_path = os.path.join(self.export_folder, md_name)
             with open(md_path, "w", encoding="utf-8") as mf:
                 mf.write(f"# Channel: #{cname}\n\n")
                 mf.write(f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
@@ -400,10 +479,11 @@ def main():
     start_time = datetime.now()
     logger.info("=" * 60)
     logger.info("Slack Channel Export Tool - Starting")
+    logger.info(f"Export folder: {EXPORT_FOLDER}")
     logger.info("=" * 60)
     
     try:
-        exporter = SlackExporter(SLACK_TOKEN, OUTPUT_DIR)
+        exporter = SlackExporter(SLACK_TOKEN, EXPORT_FOLDER)
         exporter.load_users()
         
         # Get and display channels (alphabetically sorted)
@@ -451,7 +531,7 @@ def main():
             print("📜 Exporting all available messages.\n")
             logger.info("Date filter: ALL messages")
         
-        print(f"Files will be created in:\n📂 {OUTPUT_DIR}\n")
+        print(f"Files will be created in:\n📂 {EXPORT_FOLDER}\n")
         
         if DOWNLOAD_FILES:
             print("📥 File downloads enabled - this may take longer\n")
@@ -497,15 +577,15 @@ def main():
                 logger.info(f"Skipped {len(skipped)} empty channels: {skipped}")
             
             print("─" * 100)
-            print(f"🎯 Files saved to: {OUTPUT_DIR}\n")
+            print(f"🎯 Files saved to: {EXPORT_FOLDER}\n")
             
             if DOWNLOAD_FILES:
-                attach_dir = os.path.join(OUTPUT_DIR, "attachments")
+                attach_dir = os.path.join(EXPORT_FOLDER, "attachments")
                 if os.path.exists(attach_dir):
                     print(f"📥 Attachments saved to: {attach_dir}\n")
             
             # Save anonymization key
-            key_file = os.path.join(OUTPUT_DIR, f"{timestamp_str}-anonymization-key.json")
+            key_file = os.path.join(EXPORT_FOLDER, f"{timestamp_str}-anonymization-key.json")
             anon_key = {anon: exporter.id_to_name.get(uid, uid) for uid, anon in exporter.anon_map.items()}
             with open(key_file, "w", encoding="utf-8") as kf:
                 json.dump(anon_key, kf, indent=2)
@@ -522,8 +602,7 @@ def main():
             print(f"   • Time elapsed: {elapsed_time.total_seconds():.1f} seconds")
             
             if ENABLE_LOGGING:
-                log_file = os.path.join(OUTPUT_DIR, f"slack_export_{start_time.strftime('%Y%m%d_%H%M%S')}.log")
-                print(f"   • Log file: {os.path.basename(log_file)}")
+                print(f"   • Log file: {EXPORT_TIMESTAMP}-export.log")
             
             logger.info("=" * 60)
             logger.info(f"Export completed successfully")
