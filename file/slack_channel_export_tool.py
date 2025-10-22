@@ -29,11 +29,20 @@ This tool is provided for legitimate backup, compliance, and archival purposes o
 """
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
-import json, re, os, time, sys
+import json, re, os, time, sys, logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
-from urllib.request import urlretrieve
 from pathlib import Path
+
+# Try to import requests for better file downloads
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+    print("⚠️  'requests' library not found. File downloads will be limited.")
+    print("   Install with: pip install requests")
+    print()
 
 # === USER SETTINGS ===
 SLACK_TOKEN = "xoxp-123456789..."        # Paste your Slack user token here
@@ -42,8 +51,26 @@ FETCH_THREADS = True                      # Set to False to skip threaded replie
 INCLUDE_REACTIONS = True                  # Include emoji reactions in output
 DOWNLOAD_FILES = False                    # Set to True to download file attachments (slower, uses disk space)
 CREATE_MARKDOWN = False                   # Set to True to create .md formatted output
+ENABLE_LOGGING = True                     # Set to True to create detailed log files
 MAX_RETRIES = 3                          # Number of retries for API calls
 # ======================
+
+# Configure logging if enabled
+if ENABLE_LOGGING:
+    log_filename = os.path.join(OUTPUT_DIR, f"slack_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(log_filename, encoding='utf-8'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    logger = logging.getLogger(__name__)
+else:
+    logging.basicConfig(level=logging.WARNING)
+    logger = logging.getLogger(__name__)
 
 class SlackExporter:
     def __init__(self, token: str, output_dir: str):
@@ -74,6 +101,7 @@ class SlackExporter:
     def load_users(self):
         """Load all users from the workspace."""
         print("\n🔗 Connecting to Slack workspace...")
+        logger.info("Starting user list retrieval")
         users, cursor = [], None
         while True:
             resp = self.retry_api_call(self.client.users_list, cursor=cursor)
@@ -87,6 +115,7 @@ class SlackExporter:
             for u in users
         }
         print(f"👥 Loaded {len(self.id_to_name)} user profiles")
+        logger.info(f"Successfully loaded {len(self.id_to_name)} user profiles")
 
     def get_channels(self) -> List[Dict]:
         """Retrieve all accessible channels, sorted alphabetically."""
@@ -138,9 +167,15 @@ class SlackExporter:
         if not DOWNLOAD_FILES:
             return None
         
+        if not HAS_REQUESTS:
+            logger.warning("Cannot download files without 'requests' library installed")
+            return None
+        
         try:
+            # Get download URL
             url = file_info.get("url_private_download") or file_info.get("url_private")
             if not url:
+                logger.warning(f"No download URL found for file: {file_info.get('name', 'unknown')}")
                 return None
             
             # Create attachments directory
@@ -155,16 +190,22 @@ class SlackExporter:
             
             # Download with authentication
             headers = {"Authorization": f"Bearer {self.client.token}"}
-            from urllib.request import Request
-            req = Request(url, headers=headers)
+            response = requests.get(url, headers=headers, stream=True, timeout=30)
+            response.raise_for_status()
             
-            # Note: This is a simplified version. For production, use requests library
-            # with proper error handling and progress tracking
-            urlretrieve(req, local_path)
+            # Save file
+            with open(local_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
             
+            logger.info(f"Downloaded: {original_name}")
             return os.path.relpath(local_path, self.output_dir)
+            
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Failed to download {file_info.get('name', 'unknown')}: {str(e)}")
+            return None
         except Exception as e:
-            print(f"⚠️  Failed to download file: {e}")
+            logger.warning(f"Unexpected error downloading file: {str(e)}")
             return None
 
     def fetch_thread_replies(self, channel_id: str, thread_ts: str) -> List[Dict]:
@@ -271,18 +312,24 @@ class SlackExporter:
         """Export a single channel's messages."""
         cname = channel["name"]
         print(f"📡 Exporting channel: #{cname}")
+        logger.info(f"Starting export for channel: #{cname}")
         
         messages = self.fetch_messages(channel["id"], cutoff_ts)
         
         # Download files if enabled
         if DOWNLOAD_FILES and messages:
             print(f"   → Downloading attachments...")
+            logger.info(f"Downloading attachments for #{cname}")
+            file_count = 0
             for msg in messages:
                 if msg.get("files"):
                     for file_info in msg["files"]:
                         local_path = self.download_file(file_info, cname, msg["ts"])
                         if local_path:
                             file_info["local_path"] = local_path
+                            file_count += 1
+            if file_count > 0:
+                logger.info(f"Downloaded {file_count} files for #{cname}")
         
         msg_count = len(messages)
         thread_count = sum(1 for m in messages if m.get("thread_messages"))
@@ -290,9 +337,11 @@ class SlackExporter:
         # Skip if no messages
         if msg_count == 0:
             print(f"   ⚠️  No messages found in date range - skipping file creation")
+            logger.info(f"No messages found for #{cname} in date range")
             return (cname, 0, None, None, None)
         
         print(f"   → Retrieved {msg_count} messages ({thread_count} with threads)")
+        logger.info(f"Retrieved {msg_count} messages ({thread_count} with threads) for #{cname}")
         
         json_name = f"{timestamp_str}-Slack-Export-{cname}.json"
         txt_name = f"{timestamp_str}-Slack-Export-{cname}.txt"
@@ -302,6 +351,7 @@ class SlackExporter:
         json_path = os.path.join(self.output_dir, json_name)
         with open(json_path, "w", encoding="utf-8") as jf:
             json.dump(messages, jf, indent=2, ensure_ascii=False)
+        logger.info(f"Saved JSON: {json_name}")
         
         # Save text
         txt_path = os.path.join(self.output_dir, txt_name)
@@ -316,6 +366,7 @@ class SlackExporter:
                         tf.write(self.format_message_text(reply, indent=2, format_type="text") + "\n")
                 
                 tf.write("\n")
+        logger.info(f"Saved TXT: {txt_name}")
         
         # Save markdown if enabled
         if CREATE_MARKDOWN:
@@ -334,6 +385,7 @@ class SlackExporter:
                             mf.write(self.format_message_text(reply, indent=2, format_type="markdown"))
                     
                     mf.write("\n")
+            logger.info(f"Saved MD: {md_name}")
         
         files_created = f"{json_name}, {txt_name}"
         if CREATE_MARKDOWN:
@@ -345,12 +397,18 @@ class SlackExporter:
 
 def main():
     """Main execution function."""
+    start_time = datetime.now()
+    logger.info("=" * 60)
+    logger.info("Slack Channel Export Tool - Starting")
+    logger.info("=" * 60)
+    
     try:
         exporter = SlackExporter(SLACK_TOKEN, OUTPUT_DIR)
         exporter.load_users()
         
         # Get and display channels (alphabetically sorted)
         channels = exporter.get_channels()
+        logger.info(f"Found {len(channels)} accessible channels")
         print("\n📋 Channels available (alphabetical):")
         for i, c in enumerate(channels, start=1):
             privacy = "🔒" if c.get("is_private") else "🌐"
@@ -360,13 +418,17 @@ def main():
         sel = input("\nEnter channel number(s) (comma-separated, or 'all'): ").strip().lower()
         if sel == "all":
             selected = channels
+            logger.info("User selected: ALL channels")
         else:
             try:
                 selected = [channels[int(s)-1] for s in sel.split(",") if s.strip().isdigit()]
+                logger.info(f"User selected {len(selected)} channel(s): {[c['name'] for c in selected]}")
             except Exception:
+                logger.error("Invalid channel selection")
                 raise SystemExit("❌ Invalid selection.")
         
         if not selected:
+            logger.error("No channels selected")
             raise SystemExit("❌ No valid channels selected.")
         
         # Date range filter
@@ -383,14 +445,17 @@ def main():
         if days:
             cutoff_ts = time.mktime((datetime.now() - timedelta(days=days)).timetuple())
             print(f"⏱ Exporting messages newer than {days} days ago.\n")
+            logger.info(f"Date filter: Last {days} days")
         else:
             cutoff_ts = None
             print("📜 Exporting all available messages.\n")
+            logger.info("Date filter: ALL messages")
         
         print(f"Files will be created in:\n📂 {OUTPUT_DIR}\n")
         
         if DOWNLOAD_FILES:
             print("📥 File downloads enabled - this may take longer\n")
+            logger.info("File downloads: ENABLED")
         
         # Create timestamp for filenames (YYYY-MM-DD-HHMM format)
         timestamp_str = datetime.now().strftime("%Y-%m-%d-%H%M")
@@ -407,7 +472,9 @@ def main():
                 else:
                     summary.append(result)
             except Exception as e:
-                print(f"❌ Error exporting #{ch['name']}: {e}")
+                error_msg = f"Error exporting #{ch['name']}: {e}"
+                print(f"❌ {error_msg}")
+                logger.error(error_msg, exc_info=True)
                 continue
         
         # Summary table
@@ -427,6 +494,7 @@ def main():
                 print("\n⚠️  Channels with no messages in date range (files not created):")
                 for cname in skipped:
                     print(f"   • {cname}")
+                logger.info(f"Skipped {len(skipped)} empty channels: {skipped}")
             
             print("─" * 100)
             print(f"🎯 Files saved to: {OUTPUT_DIR}\n")
@@ -442,14 +510,39 @@ def main():
             with open(key_file, "w", encoding="utf-8") as kf:
                 json.dump(anon_key, kf, indent=2)
             print(f"🔑 Anonymization key saved to: {os.path.basename(key_file)}")
-            print("    (Keep this file secure - it maps anonymous IDs back to real usernames)")
+            print("    (Keep this file secure - it maps anonymous IDs back to real usernames)\n")
+            logger.info(f"Saved anonymization key: {key_file}")
+            
+            # Export statistics
+            total_messages = sum(s[1] for s in summary)
+            elapsed_time = datetime.now() - start_time
+            print(f"📊 Export Statistics:")
+            print(f"   • Channels exported: {len(summary)}")
+            print(f"   • Total messages: {total_messages}")
+            print(f"   • Time elapsed: {elapsed_time.total_seconds():.1f} seconds")
+            
+            if ENABLE_LOGGING:
+                log_file = os.path.join(OUTPUT_DIR, f"slack_export_{start_time.strftime('%Y%m%d_%H%M%S')}.log")
+                print(f"   • Log file: {os.path.basename(log_file)}")
+            
+            logger.info("=" * 60)
+            logger.info(f"Export completed successfully")
+            logger.info(f"Channels: {len(summary)}, Messages: {total_messages}, Time: {elapsed_time.total_seconds():.1f}s")
+            logger.info("=" * 60)
         
     except KeyboardInterrupt:
         print("\n\n⚠️  Export interrupted by user")
+        logger.warning("Export interrupted by user (KeyboardInterrupt)")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Fatal error: {e}")
+        error_msg = f"Fatal error: {e}"
+        print(f"\n❌ {error_msg}")
+        logger.error(error_msg, exc_info=True)
         sys.exit(1)
+    finally:
+        # Pause before closing (Windows convenience)
+        print("\n" + "─" * 60)
+        input("Press Enter to exit...")
 
 
 if __name__ == "__main__":
