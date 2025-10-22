@@ -55,6 +55,7 @@ im:read             (View basic DM info)
 mpim:history        (View messages in group DMs)
 mpim:read           (View basic group DM info)
 users:read          (View user information)
+files:read          (View attached files)
 ```
 
 ### Step 4: Install the App
