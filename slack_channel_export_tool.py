@@ -59,12 +59,15 @@ def load_config():
         }
     }
     
-    config_path = "config.json"
+    # Look for config.json in the same directory as this script
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(script_dir, "config.json")
+    
     if os.path.exists(config_path):
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
                 loaded_config = json.load(f)
-                print("✅ Loaded configuration from config.json")
+                print(f"✅ Loaded configuration from {config_path}")
                 return loaded_config
         except Exception as e:
             print(f"⚠️  Error loading config.json: {e}")
@@ -72,6 +75,7 @@ def load_config():
             return default_config
     else:
         print("ℹ️  No config.json found - using default settings")
+        print(f"   Looking in: {script_dir}")
         print("   To use config file: copy config.example.json to config.json and edit")
         return default_config
 
@@ -227,8 +231,21 @@ class SlackExporter:
             return None
         
         try:
-            # Get download URL (prefer url_private_download)
-            url = file_info.get("url_private_download") or file_info.get("url_private")
+            # Try to get a fresh download URL using files.info API
+            file_id = file_info.get("id")
+            if file_id:
+                try:
+                    file_details = self.client.files_info(file=file_id)
+                    # Get the fresh URL from the API response
+                    url = file_details.get("file", {}).get("url_private_download") or \
+                          file_details.get("file", {}).get("url_private")
+                    logger.debug(f"Got fresh URL for {file_info.get('name')} via API")
+                except Exception as e:
+                    logger.debug(f"Could not get fresh URL via API: {e}, using URL from message")
+                    url = file_info.get("url_private_download") or file_info.get("url_private")
+            else:
+                url = file_info.get("url_private_download") or file_info.get("url_private")
+            
             if not url:
                 logger.warning(f"No download URL found for file: {file_info.get('name', 'unknown')}")
                 return None
@@ -246,19 +263,48 @@ class SlackExporter:
             # Get expected file size from metadata
             expected_size = file_info.get("size", 0)
             
-            # Download with authentication - DON'T use streaming for better reliability
-            headers = {"Authorization": f"Bearer {self.client.token}"}
-            logger.debug(f"Downloading {original_name} from {url[:50]}...")
+            # Download with authentication - allow redirects and add additional headers
+            headers = {
+                "Authorization": f"Bearer {self.client.token}",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
             
-            # Download entire file at once (more reliable than streaming for these file sizes)
-            response = requests.get(url, headers=headers, timeout=60)
+            logger.debug(f"Downloading {original_name} (expected: {expected_size:,} bytes)")
+            
+            # Download with redirect following
+            response = requests.get(
+                url, 
+                headers=headers, 
+                allow_redirects=True,
+                timeout=60
+            )
             response.raise_for_status()
             
             # Check content type - make sure we got the actual file, not an error page
-            content_type = response.headers.get('content-type', '')
-            if 'text/html' in content_type:
-                logger.error(f"Got HTML instead of file for {original_name} - may be auth issue")
-                return None
+            content_type = response.headers.get('content-type', '').lower()
+            
+            # Log what we got
+            logger.debug(f"Response content-type: {content_type}")
+            logger.debug(f"Response size: {len(response.content):,} bytes")
+            
+            # Check if we got HTML instead of the file
+            if 'text/html' in content_type or 'application/xhtml' in content_type:
+                logger.error(f"Got HTML instead of file for {original_name}")
+                logger.debug(f"Response preview: {response.text[:200]}")
+                
+                # Try alternate URL if available
+                alt_url = file_info.get("url_private") if "url_private_download" in url else file_info.get("url_private_download")
+                if alt_url and alt_url != url:
+                    logger.info(f"Trying alternate URL for {original_name}")
+                    response = requests.get(alt_url, headers=headers, allow_redirects=True, timeout=60)
+                    response.raise_for_status()
+                    content_type = response.headers.get('content-type', '').lower()
+                    
+                    if 'text/html' in content_type:
+                        logger.error(f"Alternate URL also returned HTML for {original_name}")
+                        return None
+                else:
+                    return None
             
             # Save file
             with open(local_path, 'wb') as f:
@@ -273,12 +319,12 @@ class SlackExporter:
                 return None
             
             # Verify size matches expected
-            if expected_size > 0 and actual_size != expected_size:
+            if expected_size > 0:
                 size_diff = abs(actual_size - expected_size)
-                percent_diff = (size_diff / expected_size) * 100
+                percent_diff = (size_diff / expected_size) * 100 if expected_size > 0 else 0
                 
                 if percent_diff > 5:  # More than 5% difference is concerning
-                    logger.warning(f"Size mismatch for {original_name}: expected {expected_size}, got {actual_size} ({percent_diff:.1f}% diff)")
+                    logger.warning(f"Size mismatch for {original_name}: expected {expected_size:,}, got {actual_size:,} ({percent_diff:.1f}% diff)")
                 else:
                     logger.info(f"Downloaded: {original_name} ({actual_size:,} bytes)")
             else:
@@ -287,7 +333,9 @@ class SlackExporter:
             return os.path.relpath(local_path, self.export_folder)
             
         except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP error downloading {file_info.get('name', 'unknown')}: {e.response.status_code}")
+            logger.error(f"HTTP {e.response.status_code} downloading {file_info.get('name', 'unknown')}")
+            if e.response.status_code == 403:
+                logger.error("403 Forbidden - Token may be missing 'files:read' scope")
             return None
         except requests.exceptions.RequestException as e:
             logger.warning(f"Network error downloading {file_info.get('name', 'unknown')}: {str(e)}")
