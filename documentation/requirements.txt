@@ -4,8 +4,8 @@
 # Core dependency for Slack API access
 slack-sdk>=3.0.0
 
+# Required for file downloads
+requests>=2.31.0
+
 # Optional: For better progress bars (future enhancement)
 # tqdm>=4.65.0
-
-# Optional: For better file download handling (future enhancement)
-# requests>=2.31.0
