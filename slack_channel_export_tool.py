@@ -1,4 +1,5 @@
 # slack_channel_export_tool.py
+# Claude Artifact v18
 """
 Slack Channel Export Tool
 Exports Slack channel messages with anonymization, thread support, and flexible filtering.
@@ -90,6 +91,7 @@ INCLUDE_REACTIONS = config.get("features", {}).get("include_reactions", True)
 DOWNLOAD_FILES = config.get("features", {}).get("download_files", False)
 CREATE_MARKDOWN = config.get("features", {}).get("create_markdown", False)
 ENABLE_LOGGING = config.get("features", {}).get("enable_logging", True)
+ANONYMIZE_IPS = config.get("features", {}).get("anonymize_ips", False)
 MAX_RETRIES = config.get("performance", {}).get("max_retries", 3)
 
 # Create timestamped export folder
@@ -204,6 +206,64 @@ class SlackExporter:
             self.anon_map[uid] = f"anon{self.anon_counter:02d}"
             self.anon_counter += 1
         return self.anon_map[uid]
+    
+    def is_private_or_special_ip(self, ip: str) -> bool:
+        """Check if IP is private/internal or special use (should NOT be anonymized)."""
+        try:
+            parts = [int(p) for p in ip.split('.')]
+            if len(parts) != 4:
+                return False
+            
+            # Check for private ranges (RFC 1918)
+            if parts[0] == 10:  # 10.0.0.0/8
+                return True
+            if parts[0] == 172 and 16 <= parts[1] <= 31:  # 172.16.0.0/12
+                return True
+            if parts[0] == 192 and parts[1] == 168:  # 192.168.0.0/16
+                return True
+            
+            # Localhost
+            if parts[0] == 127:  # 127.0.0.0/8
+                return True
+            
+            # Link-local
+            if parts[0] == 169 and parts[1] == 254:  # 169.254.0.0/16
+                return True
+            
+            # Unspecified
+            if ip == "0.0.0.0":
+                return True
+            
+            # Common public DNS servers (not sensitive)
+            public_dns = [
+                "8.8.8.8", "8.8.4.4",  # Google
+                "1.1.1.1", "1.0.0.1",  # Cloudflare
+                "9.9.9.9",              # Quad9
+                "208.67.222.222", "208.67.220.220"  # OpenDNS
+            ]
+            if ip in public_dns:
+                return True
+            
+            return False
+        except (ValueError, IndexError):
+            return False
+    
+    def anonymize_ip_addresses(self, text: str) -> str:
+        """Replace public IP addresses with [IP-REDACTED], keep private/internal IPs."""
+        if not ANONYMIZE_IPS:
+            return text
+        
+        # Regex to match IPv4 addresses
+        ip_pattern = r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b'
+        
+        def replace_ip(match):
+            ip = match.group(0)
+            if self.is_private_or_special_ip(ip):
+                return ip  # Keep private/internal IPs unchanged
+            else:
+                return "[IP-REDACTED]"  # Anonymize public IPs
+        
+        return re.sub(ip_pattern, replace_ip, text)
 
     def clean_text(self, text: str, format_type: str = "text") -> str:
         """Sanitize message text by removing/replacing sensitive content."""
@@ -219,6 +279,10 @@ class SlackExporter:
         text = re.sub(r"<(http[^>|]+)(\|[^>]+)?>", r"\1", text)
         # Remove channel mentions
         text = re.sub(r"<#[^>]+>", "[channel]", text)
+        
+        # Anonymize public IP addresses if enabled
+        text = self.anonymize_ip_addresses(text)
+        
         return text.strip()
 
     def download_file(self, file_info: Dict, channel_name: str, msg_ts: str) -> Optional[str]:
@@ -256,8 +320,16 @@ class SlackExporter:
             
             # Generate safe filename
             original_name = file_info.get("name", "unknown")
+            
+            # Sanitize filename - remove/replace invalid Windows characters
+            # Invalid: < > : " / \ | ? *
+            safe_name = original_name
+            invalid_chars = '<>:"/\\|?*'
+            for char in invalid_chars:
+                safe_name = safe_name.replace(char, '_')
+            
             timestamp = msg_ts.replace(".", "_")
-            safe_filename = f"{timestamp}_{original_name}"
+            safe_filename = f"{timestamp}_{safe_name}"
             local_path = os.path.join(attach_dir, safe_filename)
             
             # Get expected file size from metadata
