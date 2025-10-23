@@ -17,6 +17,7 @@ config.json
 !README.md
 !LICENSE
 !CHANGELOG.md
+!config.example.json
 
 # Export directories
 output/
