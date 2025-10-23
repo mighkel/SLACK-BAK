@@ -1,0 +1,44 @@
+{
+  "_comment": "Slack Channel Export Tool Configuration v3",
+  "_instructions": "Copy this file to 'config.json' and update with your settings. Add config.json to .gitignore to prevent committing your token.",
+  
+  "slack_token": "xoxp-your-user-token-here",
+  "output_dir": "C:\\SlackExports\\Output",
+  
+  "features": {
+    "fetch_threads": true,
+    "include_reactions": true,
+    "download_files": false,
+    "create_markdown": false,
+    "enable_logging": true,
+    "anonymize_ips": false,
+    "_ip_anonymization_note": "When true, replaces public IP addresses with [IP-REDACTED]. Keeps private IPs (10.x, 192.168.x, 172.16-31.x) and localhost (127.x) unchanged."
+  },
+  
+  "performance": {
+    "max_retries": 3,
+    "rate_limit_delay": 1
+  },
+  
+  "filters": {
+    "_comment": "Optional: Preset filters (not yet implemented)",
+    "exclude_channels": [],
+    "include_only_channels": [],
+    "exclude_users": [],
+    "date_range_days": null
+  },
+  
+  "anonymization": {
+    "_comment": "Future feature: control anonymization behavior",
+    "enabled": true,
+    "anonymize_files": false,
+    "save_mapping_key": true
+  },
+  
+  "advanced": {
+    "_comment": "Advanced settings for power users",
+    "debug_mode": false,
+    "export_format_version": "2.0",
+    "preserve_deleted_messages": false
+  }
+}
