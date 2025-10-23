@@ -18,6 +18,7 @@ config.json
 !LICENSE
 !CHANGELOG.md
 !config.example.json
+!IP_ANONYMIZATION.md
 
 # Export directories
 output/
@@ -25,6 +26,7 @@ exports/
 Output/
 SlackExports/
 attachments/
+!docs/
 
 # Anonymization keys (sensitive!)
 *anonymization-key*
