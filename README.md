@@ -55,7 +55,6 @@ im:read             (View basic DM info)
 mpim:history        (View messages in group DMs)
 mpim:read           (View basic group DM info)
 users:read          (View user information)
-files:read          (View attached files)
 ```
 
 ### Step 4: Install the App
@@ -564,7 +563,7 @@ For issues specific to this tool, please check the troubleshooting section above
 
 ---
 
-**Version**: 2.0  
-**Last Updated**: January 2025  
+**Version**: 2.0  (cAI v9)
+**Last Updated**: October 2025  
 **Python**: 3.7+  
 **Dependencies**: slack-sdk
