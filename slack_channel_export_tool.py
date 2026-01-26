@@ -285,11 +285,59 @@ class SlackExporter:
         
         return text.strip()
 
+    def download_thumbnail(self, file_info: Dict, channel_name: str, msg_ts: str) -> Optional[str]:
+        """Download video thumbnail if available."""
+        if not DOWNLOAD_FILES or not HAS_REQUESTS:
+            return None
+
+        # Try to get the best available thumbnail (prefer higher quality)
+        thumbnail_url = (
+            file_info.get('thumb_480') or
+            file_info.get('thumb_360') or
+            file_info.get('thumb_720') or
+            file_info.get('thumb_160') or
+            file_info.get('thumb_80')
+        )
+
+        if not thumbnail_url:
+            return None
+
+        try:
+            # Create attachments directory
+            attach_dir = os.path.join(self.export_folder, "attachments", channel_name)
+            os.makedirs(attach_dir, exist_ok=True)
+
+            # Generate filename for thumbnail
+            original_name = file_info.get("name", "unknown")
+            timestamp = msg_ts.replace(".", "_")
+            thumb_filename = f"{timestamp}_{original_name}_thumb.jpg"
+            local_path = os.path.join(attach_dir, thumb_filename)
+
+            # Download thumbnail with authentication
+            headers = {
+                "Authorization": f"Bearer {self.client.token}",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+
+            response = requests.get(thumbnail_url, headers=headers, allow_redirects=True, timeout=30)
+            response.raise_for_status()
+
+            # Save thumbnail
+            with open(local_path, 'wb') as f:
+                f.write(response.content)
+
+            logger.info(f"Downloaded thumbnail for: {original_name}")
+            return os.path.relpath(local_path, self.export_folder)
+
+        except Exception as e:
+            logger.warning(f"Failed to download thumbnail for {file_info.get('name', 'unknown')}: {str(e)}")
+            return None
+
     def download_file(self, file_info: Dict, channel_name: str, msg_ts: str) -> Optional[str]:
         """Download a file attachment to local storage."""
         if not DOWNLOAD_FILES:
             return None
-        
+
         if not HAS_REQUESTS:
             logger.warning("Cannot download files without 'requests' library installed")
             return None
@@ -482,10 +530,35 @@ class SlackExporter:
                     fname = f.get('name', 'unnamed')
                     ftype = f.get('mimetype', 'unknown')
                     local_path = f.get('local_path')
+                    thumbnail_path = f.get('thumbnail_path')
+
+                    # Check file type
+                    is_image = ftype and ftype.startswith('image/')
+                    is_video = ftype and ftype.startswith('video/')
+
                     if local_path:
-                        output += f"{prefix}📎 [{fname}]({local_path}) ({ftype})\n"
+                        if is_image:
+                            # Display image inline in markdown
+                            output += f"{prefix}![{fname}]({local_path})\n"
+                            output += f"{prefix}*{fname} ({ftype})*\n"
+                        elif is_video:
+                            # Display video with thumbnail if available
+                            if thumbnail_path:
+                                # Clickable thumbnail that links to video
+                                output += f"{prefix}[![{fname}]({thumbnail_path})]({local_path})\n"
+                                output += f"{prefix}*🎥 {fname} ({ftype}) - Click thumbnail to view video*\n"
+                            else:
+                                # Video without thumbnail
+                                output += f"{prefix}🎥 [{fname}]({local_path}) ({ftype})\n"
+                        else:
+                            # Regular file link
+                            output += f"{prefix}📎 [{fname}]({local_path}) ({ftype})\n"
                     else:
-                        output += f"{prefix}📎 {fname} ({ftype})\n"
+                        # File not downloaded
+                        if is_video:
+                            output += f"{prefix}🎥 {fname} ({ftype})\n"
+                        else:
+                            output += f"{prefix}📎 {fname} ({ftype})\n"
         else:
             # Plain text format
             prefix = "  " * indent
@@ -523,10 +596,17 @@ class SlackExporter:
             for msg in messages:
                 if msg.get("files"):
                     for file_info in msg["files"]:
+                        # Download the main file
                         local_path = self.download_file(file_info, cname, msg["ts"])
                         if local_path:
                             file_info["local_path"] = local_path
                             file_count += 1
+
+                        # Download thumbnail for videos
+                        if file_info.get('mimetype', '').startswith('video/'):
+                            thumb_path = self.download_thumbnail(file_info, cname, msg["ts"])
+                            if thumb_path:
+                                file_info["thumbnail_path"] = thumb_path
             if file_count > 0:
                 logger.info(f"Downloaded {file_count} files for #{cname}")
         
